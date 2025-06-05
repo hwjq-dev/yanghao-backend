@@ -1,0 +1,48 @@
+version: "3.7"
+
+services:
+  cache:
+    container_name: Redis
+    image: redis:6.2-alpine
+    restart: always
+    ports:
+      - "6379:6379"
+    command: redis-server --save 20 1 --loglevel warning --requirepass fa022bd1861b60084ef23d786b23c3da
+    volumes:
+      - ./redis-cache:/data
+
+  db:
+    container_name: mongoDB
+    image: mongo:latest
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_INITDB_ROOT_USERNAME}
+      - MONGO_INITDB_DATABASE=${MONGO_INITDB_DATABASE}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_INITDB_ROOT_PASSWORD}
+    networks:
+      - mongo-compose-network
+    ports:
+      - "27017:27017"
+    volumes:
+      - ./data:/data/db
+
+  mongo-express:
+    container_name: mongo-express
+    image: mongo-express
+    depends_on:
+      - db
+    networks:
+      - mongo-compose-network
+    environment:
+      - ME_CONFIG_MONGODB_SERVER=${ME_CONFIG_MONGODB_SERVER}
+      - ME_CONFIG_MONGODB_ADMINUSERNAME=${ME_CONFIG_MONGODB_ADMINUSERNAME}
+      - ME_CONFIG_MONGODB_ADMINPASSWORD=${ME_CONFIG_MONGODB_ADMINPASSWORD}
+      - ME_CONFIG_BASICAUTH_USERNAME=${ME_CONFIG_BASICAUTH_USERNAME}
+      - ME_CONFIG_BASICAUTH_PASSWORD=${ME_CONFIG_BASICAUTH_PASSWORD}
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./data:/data/db
+
+networks:
+  mongo-compose-network:
+    driver: bridge

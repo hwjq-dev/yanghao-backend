@@ -1,0 +1,22 @@
+
+node_modules/
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+.pnpm-debug.log
+.yarn/
+redis-cache
+data
+
+
+# Environment variables
+.env
+
+/dist/
+/build/
+/out/
+
+# Log files
+*.log
+logs/
+.vscode/
