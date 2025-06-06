@@ -2,16 +2,16 @@ import mongoose from "mongoose";
 
 const TgAccountStableSchema = new mongoose.Schema(
   {
-    tgId: { type: String, required: true },
-    username: { type: String, required: true },
+    tgId: { type: String, required: true, index: true },
+    username: { type: String, required: true, index: true },
     nickname: { type: String, required: true },
-    phoneNumber: { type: String, required: true },
-    serverIp: { type: String, required: true },
+    phoneNumber: { type: String, required: true, index: true },
+    serverIp: { type: String, require: false, default: "空白", index: true },
     accountBio: { type: String, required: true },
-    accountType: { type: String, required: true },
+    accountType: { type: String, required: true, index: true },
     isPremium: { type: Boolean, required: true },
-    profileUrl: { type: String },
-    profileCount: { type: Number },
+    profileUrl: { type: String, require: false, default: "空白" },
+    profileCount: { type: Number, require: false, default: 0 },
   },
   {
     timestamps: {

@@ -3,7 +3,7 @@ import mongoose from "mongoose";
 const TgAccounPassCodeSchema = new mongoose.Schema(
   {
     password: { type: String, required: false, default: null },
-    type: { type: String, unique: true },
+    type: { type: String, unique: true, index: true },
   },
   {
     timestamps: {

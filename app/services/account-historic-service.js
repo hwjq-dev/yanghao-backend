@@ -1,16 +1,16 @@
-import { TgAccountModel } from "../model/tg-account.js";
+import { TgAccountStableModel } from "../model/tg-account-stable.js";
 import { isEmpty } from "radash";
 
 //-- Used only in bot
-export async function insertAccount(data) {
+export async function insertHistoricAccount(data) {
   try {
-    const existAccount = await TgAccountModel.findOne({ ...data });
+    const existAccount = await TgAccountStableModel.findOne({ ...data });
 
     if (!isEmpty(existAccount)) {
       return { success: false, message: "数据已存在", exist: true };
     }
 
-    const newAccount = new TgAccountModel({ ...data });
+    const newAccount = new TgAccountStableModel({ ...data });
 
     await newAccount.save();
 
@@ -21,9 +21,9 @@ export async function insertAccount(data) {
   }
 }
 
-export async function updateAccount(data, id) {
+export async function updateHistoricAccount(data, id) {
   try {
-    const existAccount = await TgAccountModel.findOne({
+    const existAccount = await TgAccountStableModel.findOne({
       ...data,
     });
 
@@ -31,7 +31,7 @@ export async function updateAccount(data, id) {
       return { success: false, message: "记录已存在", flag: true };
     }
 
-    await TgAccountModel.updateOne({ _id: { $eq: id } }, { ...data });
+    await TgAccountStableModel.updateOne({ _id: { $eq: id } }, { ...data });
 
     return { success: true, message: "更新成功", flag: false };
   } catch (error) {
@@ -39,9 +39,9 @@ export async function updateAccount(data, id) {
   }
 }
 
-export async function deleteAccount(id) {
+export async function deleteHistoricAccount(id) {
   try {
-    const existAccount = await TgAccountModel.findOne({
+    const existAccount = await TgAccountStableModel.findOne({
       _id: id,
     });
 
@@ -49,7 +49,7 @@ export async function deleteAccount(id) {
       return { success: false, message: "未记录存在", flag: true };
     }
 
-    await TgAccountModel.deleteOne({ _id: id });
+    await TgAccountStableModel.deleteOne({ _id: id });
 
     return { success: true, message: "删除成功", flag: false };
   } catch (error) {
@@ -57,9 +57,9 @@ export async function deleteAccount(id) {
   }
 }
 
-export async function getAccount(id) {
+export async function getHistoricAccount(id) {
   try {
-    const existAccount = await TgAccountModel.findOne({
+    const existAccount = await TgAccountStableModel.findOne({
       _id: id,
     });
 
@@ -73,7 +73,7 @@ export async function getAccount(id) {
   }
 }
 
-export async function getAccounts(queryParams) {
+export async function getHistoricAccounts(queryParams) {
   try {
     const {
       search = "",
@@ -142,10 +142,10 @@ export async function getAccounts(queryParams) {
       ...filterDate,
     };
 
-    const total = (await TgAccountModel.countDocuments(filters)) || 0;
+    const total = (await TgAccountStableModel.countDocuments(filters)) || 0;
 
     //-- Paginated result
-    const data = await TgAccountModel.find(filters)
+    const data = await TgAccountStableModel.find(filters)
       .skip(skip)
       .limit(limit)
       .sort(sort);

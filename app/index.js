@@ -3,10 +3,13 @@ import express from "express";
 import { safeParse } from "valibot";
 import telegrambot from "node-telegram-bot-api";
 import { connectDB } from "./database-config/index.js";
-import { connectRedis } from "./redis-config/index.js";
-import { generateAccessToken } from "./lib/json-web-token.js";
+import { connectRedis as RedisDriver } from "./redis-config/index.js";
+import { generateToken } from "./lib/json-web-token.js";
 import TgAccountSchema from "./validation/tg-accounc-validation.js";
-import { authenticateToken } from "./middleware/index.js";
+import {
+  authenticateRefreshToken,
+  isAuthenticated,
+} from "./middleware/index.js";
 import { TgAccountModel } from "./model/tg-account.js";
 import { TgAccountStableModel } from "./model/tg-account-stable.js";
 import { TgAccounPassCodeModel } from "./model/tg-account-password.js";
@@ -28,6 +31,25 @@ import {
   updateAccountType,
 } from "./services/get-type.js";
 import { CACHE_KEYS } from "./lib/cache-key.js";
+import { validateAccountCreate } from "./validation/tg-account-create-validation.js";
+import {
+  deleteAccount,
+  getAccount,
+  getAccounts,
+  insertAccount,
+  updateAccount,
+} from "./services/account-service.js";
+import validateId from "./utils/validate-id.js";
+import {
+  deleteHistoricAccount,
+  getHistoricAccount,
+  getHistoricAccounts,
+  insertHistoricAccount,
+  updateHistoricAccount,
+} from "./services/account-historic-service.js";
+
+import session from "express-session";
+import { RedisStore } from "connect-redis";
 
 dotenv.config();
 const PORT = process.env.PORT || 3000;
@@ -73,7 +95,25 @@ app.use(express.urlencoded({ extended: true }));
 
 //-- DB Connection
 connectDB();
-const redis = connectRedis();
+const redis = RedisDriver();
+const redisStore = new RedisStore({
+  client: redis,
+  prefix: "session:",
+});
+
+app.use(
+  session({
+    store: redisStore,
+    secret: process.env.SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      maxAge: 1000 * 60 * 60 * 24, // 1 day
+      // secure: true, // enable in production with HTTPS
+    },
+  })
+);
 
 //-- Bot Configuration
 const token = process.env.BOT_TOKEN;
@@ -116,6 +156,21 @@ bot.onText(/\/start/, (msg) => {
   });
 });
 
+bot.onText(/\/update/, (msg) => {
+  bot.sendMessage(
+    msg.chat.id,
+    "👇 请点击以下__*立即共享手机号安妞*__为共享您的电话号码",
+    {
+      reply_markup: {
+        keyboard: [[{ text: "📞 立即共享手机号", request_contact: true }]],
+        one_time_keyboard: true,
+        resize_keyboard: true,
+      },
+      parse_mode: "MarkdownV2",
+    }
+  );
+});
+
 // --- 机器人逻辑
 bot.on("callback_query", async (callbackQuery) => {
   try {
@@ -129,19 +184,65 @@ bot.on("callback_query", async (callbackQuery) => {
     const phone = JSON.parse(cacheData)?.phoneNumber;
 
     if (data === "option1") {
-      bot.sendMessage(
-        msg.chat.id,
-        "👇 请点击以下__*立即共享手机号安妞*__为共享您的电话号码",
-        {
-          reply_markup: {
-            keyboard: [[{ text: "📞 立即共享手机号", request_contact: true }]],
-            one_time_keyboard: true,
-            resize_keyboard: true,
-          },
-          parse_mode: "MarkdownV2",
-        }
-      );
-      return;
+      // 查找增加记录是否存在
+      const account = await TgAccountModel.findOne({
+        tgId: user.id,
+      });
+
+      if (isEmpty(account)) {
+        bot.sendMessage(
+          msg.chat.id,
+          "👇 请点击以下__*立即共享手机号安妞*__为共享您的电话号码",
+          {
+            reply_markup: {
+              keyboard: [
+                [{ text: "📞 立即共享手机号", request_contact: true }],
+              ],
+              one_time_keyboard: true,
+              resize_keyboard: true,
+            },
+            parse_mode: "MarkdownV2",
+          }
+        );
+        return;
+      }
+
+      // If account already exist
+      const updateData = {
+        tgId: `${user.id}`,
+        isPremium: false,
+        accountBio: chatMember?.bio || account?.accountBio,
+        accountType: account?.accountType,
+        nickname: `${user.first_name} ${user.last_name}`,
+        phoneNumber: account?.phoneNumber,
+        username: user.username || account?.username,
+        serverIp: account?.serverIp,
+        profileUrl: account?.profileUrl,
+        profileCount: account?.profileCount,
+      };
+
+      const synitizeFields = {
+        tgId: account.tgId,
+        isPremium: account.isPremium,
+        accountBio: account.accountBio,
+        accountType: account.accountType,
+        nickname: account.nickname,
+        phoneNumber: account.phoneNumber,
+        username: account.username,
+        serverIp: account.serverIp,
+        profileUrl: account.profileUrl,
+        profileCount: account.profileCount,
+      };
+
+      //-- Update realtime account table
+
+      if (!isEqual(updateData, synitizeFields)) {
+        await TgAccountModel.updateOne({ tgId: user.id }, { ...updateData });
+        const historicAccount = new TgAccountStableModel(updateData);
+        await historicAccount.save();
+      }
+
+      bot.sendMessage(msg.chat.id, "✅ 打卡已成功");
     }
 
     if (!isEmpty(matchType)) {
@@ -249,21 +350,122 @@ app.post(`/webhook/telegram/${token}`, (req, res) => {
 });
 
 /**
- * Generate api token
+ * Auth(Login)
  */
-app.get("/api/token", async function (__, res) {
-  const accessToken = generateAccessToken();
+app.post("/login", authenticateRefreshToken, async function (req, res) {
+  const preUsername = process.env.AUTH_USERNAME;
+  const prePassword = process.env.AUTH_PASSWORD;
+
+  const { username = "", password = "" } = req.body || {};
+
+  if (isEmpty(username) || isEmpty(password))
+    return res.status(400).json({
+      message: "Missing required fields.",
+    });
+
+  if (
+    !isEqual(
+      { username, password },
+      { username: preUsername, password: prePassword }
+    )
+  ) {
+    return res.status(400).json({
+      message: "Invalid credential.",
+    });
+  }
+  const accessToken = generateToken("accessToken");
+  req.session.auth = { username, password, token: accessToken };
+
   return res.status(200).json({
-    status: 200,
-    message: "Access token generated successfully",
+    message: "Login success",
+  });
+});
+
+/**
+ * Auth(Logout)
+ */
+app.get("/logout", isAuthenticated, async function (req, res) {
+  req.session.destroy(() => {
+    res.clearCookie("connect.sid");
+    res.status(200).json({
+      message: "Login out success",
+    });
+  });
+});
+
+/**
+ * Check is authenticated
+ */
+app.get("/authenticate", authenticateRefreshToken, async function (req, res) {
+  const isAuthenticated = req.isAuthenticated;
+  if (!!isAuthenticated)
+    return res.status(200).json({
+      message: "You are authenticated.",
+      isAuthenticated: true,
+    });
+
+  return res.status(401).json({
+    message: "You are unauthenticated.",
+    isAuthenticated: false,
+  });
+});
+
+/**
+ * Get token
+ * Input : clientId , clientSecret
+ * Result : accessToken & refreshToken
+ */
+app.post("/token", async function (req, res) {
+  const preClientId = process.env.CLIENT_ID;
+  const preClientSecret = process.env.CLIENT_SECRET;
+
+  const clientId = req.body?.clientId;
+  const clientSecret = req.body?.clientSecret;
+
+  if (isEmpty(clientId) || isEmpty(clientSecret)) {
+    return res.status(400).json({
+      message: "Missing required field.",
+    });
+  }
+
+  if (
+    !isEqual(
+      { clientId, clientSecret },
+      { clientId: preClientId, clientSecret: preClientSecret }
+    )
+  ) {
+    return res.status(400).json({
+      message: "Invalid credentials.",
+    });
+  }
+
+  const accessToken = generateToken("accessToken");
+  const refreshToken = generateToken("refreshToken");
+
+  return res.status(200).json({
+    message: "Success",
+    accessToken,
+    refreshToken,
+  });
+});
+
+/**
+ * Get access token
+ * Header : refreshToken
+ * Result : only accessToken
+ */
+app.get("/access-token", authenticateRefreshToken, async function (__, res) {
+  const accessToken = generateToken("accessToken");
+  return res.status(200).json({
+    message: "Success",
     accessToken,
   });
 });
 
 /**
- * Create account record
+ * Create account record , only used with miniApp
  */
-app.post("/tg_account", authenticateToken, async function (req, res) {
+app.post("/tg-account", isAuthenticated, async function (req, res) {
   const data = req?.body || {};
   const result = safeParse(TgAccountSchema, data);
 
@@ -366,15 +568,13 @@ app.post("/tg_account", authenticateToken, async function (req, res) {
 });
 
 /**
- * Get a specific account
+ * Get a specific account, only used with miniApp
  */
-app.get("/tg_account/:tgId", authenticateToken, async function (req, res) {
+app.get("/tg-account/:tgId", isAuthenticated, async function (req, res) {
   const tgId = req.params?.tgId;
 
   try {
-    const data = await TgAccountStableModel.findOne({
-      tgId,
-    });
+    const data = await TgAccountStableModel.findOne({ tgId });
     return res.status(200).json({
       statusCode: 200,
       message: "Success",
@@ -389,75 +589,349 @@ app.get("/tg_account/:tgId", authenticateToken, async function (req, res) {
 });
 
 /**
- * Get updated account data
+ * Insert account
  */
-app.get("/tg_account", authenticateToken, async function (req, res) {
-  const searchTerm = req.query?.search;
+app.post("/account", isAuthenticated, async function (req, res) {
+  const input = req.body || {};
+  const validateResult = validateAccountCreate(input);
 
+  if (!validateResult?.success)
+    return res.status(400).json({
+      message: "Missing required fields,or input invalid fields.",
+    });
+
+  const result = await insertAccount(validateResult?.output);
+
+  if (!result?.success && !result.exist)
+    return res.status(500).json({
+      message: "Something went wrong",
+    });
+
+  if (!result?.success && result?.exist)
+    return res.status(409).json({
+      message: result?.message,
+    });
+
+  return res.status(201).json({
+    message: result?.message,
+  });
+});
+
+/**
+ * Update account
+ */
+app.put("/account/:id", isAuthenticated, async function (req, res) {
   try {
-    if (Boolean(searchTerm)) {
-      const results =
-        (await TgAccountModel.find({
-          $or: [
-            { username: { $regex: searchTerm, $options: "i" } },
-            { nickname: { $regex: searchTerm, $options: "i" } },
-            { phoneNumber: { $regex: searchTerm, $options: "i" } },
-            { serverIp: { $regex: searchTerm, $options: "i" } },
-            { tgId: { $regex: searchTerm, $options: "i" } },
-            { accountBio: { $regex: searchTerm, $options: "i" } },
-          ],
-        })) || [];
+    const input = req.body || {};
+    const isValidId = validateId(req.params?.id || "");
 
-      return res
-        .status(200)
-        .json({ statusCode: 200, message: "OK", data: results });
+    if (!isValidId) {
+      return res.status(400).json({
+        message: "Invalid id.",
+      });
     }
 
-    const data = (await TgAccountModel.find()) || [];
-    return res.status(200).json({ statusCode: 200, message: "OK", data });
+    const validateResult = validateAccountCreate(input);
+
+    if (!validateResult?.success)
+      return res.status(400).json({
+        message: "Missing required fields,or input invalid fields.",
+      });
+
+    const result = await updateAccount(validateResult?.output, req.params?.id);
+
+    if (!result.success && !result?.flag)
+      return res.status(500).json({
+        message: "Something went wrong",
+      });
+
+    if (!result.success && result?.flag)
+      return res.status(400).json({
+        message: result?.message,
+      });
+
+    return res.status(200).json({
+      message: result?.message,
+    });
   } catch (error) {
-    return res
-      .status(500)
-      .json({ statusCode: 500, message: "Failed to fetch Telegram accounts" });
+    return res.status(400).json({
+      message: "Malicious request.",
+    });
   }
 });
 
 /**
- * Get all account stabel data
+ * Delete account
  */
-app.get("/tg_account_stable", authenticateToken, async function (req, res) {
-  const searchTerm = req.query?.search;
+app.delete("/account/:id", isAuthenticated, async function (req, res) {
   try {
-    if (Boolean(searchTerm)) {
-      const results =
-        (await TgAccountStableModel.find({
-          $or: [
-            { username: { $regex: searchTerm, $options: "i" } },
-            { nickname: { $regex: searchTerm, $options: "i" } },
-            { phoneNumber: { $regex: searchTerm, $options: "i" } },
-            { serverIp: { $regex: searchTerm, $options: "i" } },
-            { tgId: { $regex: searchTerm, $options: "i" } },
-            { accountBio: { $regex: searchTerm, $options: "i" } },
-          ],
-        })) || [];
-      return res
-        .status(200)
-        .json({ statusCode: 200, message: "OK", data: results });
+    const id = req.params.id;
+
+    const isValidId = validateId(req.params?.id || "");
+
+    if (!isValidId) {
+      return res.status(400).json({
+        message: "Invalid id.",
+      });
     }
-    const data = (await TgAccountStableModel.find()) || [];
-    return res.status(200).json({ statusCode: 200, message: "Success", data });
+
+    const result = await deleteAccount(id);
+
+    if (!result.success && !result.flag)
+      return res.status(500).json({
+        message: "Something went wrong",
+      });
+
+    if (!result.success && result?.flag)
+      return res.status(400).json({
+        message: result?.message,
+      });
+
+    return res.status(200).json({
+      message: result?.message,
+    });
   } catch (error) {
-    return res
-      .status(500)
-      .json({ statusCode: 500, message: "Failed to fetch Telegram accounts" });
+    return res.status(400).json({
+      message: "Malicious request.",
+    });
   }
+});
+
+/**
+ * Get an account
+ */
+app.get("/account/:id", isAuthenticated, async function (req, res) {
+  try {
+    const id = req.params.id;
+
+    const isValidId = validateId(req.params?.id || "");
+
+    if (!isValidId) {
+      return res.status(400).json({
+        message: "Invalid id.",
+      });
+    }
+
+    const result = await getAccount(id);
+
+    if (!result.success && !result.flag)
+      return res.status(500).json({
+        message: "Something went wrong",
+      });
+
+    if (!result.success && result?.flag)
+      return res.status(400).json({
+        message: result?.message,
+      });
+
+    return res.status(200).json({
+      message: result?.message,
+      data: result?.data,
+    });
+  } catch (error) {
+    return res.status(400).json({
+      message: "Malicious request.",
+    });
+  }
+});
+
+/**
+ * Get all account
+ */
+app.get("/accounts", isAuthenticated, async function (req, res) {
+  const queryParams = req.query || {};
+  const result = await getAccounts(queryParams);
+
+  if (!result?.success)
+    return res.status(500).json({
+      message: "Something went wrong",
+    });
+
+  return res.status(200).json({
+    message: result?.message,
+    data: result?.data,
+    page: +(result?.page || 0),
+    pageCount: +(result?.pageCount || 0),
+    total: +result?.total,
+  });
+});
+
+/**
+ * Insert historic account
+ */
+app.post("/historic-account", isAuthenticated, async function (req, res) {
+  const input = req.body || {};
+  const validateResult = validateAccountCreate(input);
+
+  if (!validateResult?.success)
+    return res.status(400).json({
+      message: "Missing required fields,or input invalid fields.",
+    });
+
+  const result = await insertHistoricAccount(validateResult?.output);
+
+  if (!result?.success && !result.exist)
+    return res.status(500).json({
+      message: "Something went wrong",
+    });
+
+  if (!result?.success && result?.exist)
+    return res.status(409).json({
+      message: result?.message,
+    });
+
+  return res.status(201).json({
+    message: result?.message,
+  });
+});
+
+/**
+ * Update account
+ */
+app.put("/historic-account/:id", isAuthenticated, async function (req, res) {
+  try {
+    const input = req.body || {};
+    const isValidId = validateId(req.params?.id || "");
+
+    if (!isValidId) {
+      return res.status(400).json({
+        message: "Invalid id.",
+      });
+    }
+
+    const validateResult = validateAccountCreate(input);
+
+    if (!validateResult?.success)
+      return res.status(400).json({
+        message: "Missing required fields,or input invalid fields.",
+      });
+
+    const result = await updateHistoricAccount(
+      validateResult?.output,
+      req.params?.id
+    );
+
+    if (!result.success && !result?.flag)
+      return res.status(500).json({
+        message: "Something went wrong",
+      });
+
+    if (!result.success && result?.flag)
+      return res.status(400).json({
+        message: result?.message,
+      });
+
+    return res.status(200).json({
+      message: result?.message,
+    });
+  } catch (error) {
+    return res.status(400).json({
+      message: "Malicious request.",
+    });
+  }
+});
+
+/**
+ * Delete account
+ */
+app.delete("/historic-account/:id", isAuthenticated, async function (req, res) {
+  try {
+    const id = req.params.id;
+
+    const isValidId = validateId(req.params?.id || "");
+
+    if (!isValidId) {
+      return res.status(400).json({
+        message: "Invalid id.",
+      });
+    }
+
+    const result = await deleteHistoricAccount(id);
+
+    if (!result.success && !result.flag)
+      return res.status(500).json({
+        message: "Something went wrong",
+      });
+
+    if (!result.success && result?.flag)
+      return res.status(400).json({
+        message: result?.message,
+      });
+
+    return res.status(200).json({
+      message: result?.message,
+    });
+  } catch (error) {
+    return res.status(400).json({
+      message: "Malicious request.",
+    });
+  }
+});
+
+/**
+ * Get an account
+ */
+app.get("/historic-account/:id", isAuthenticated, async function (req, res) {
+  try {
+    const id = req.params.id;
+
+    const isValidId = validateId(req.params?.id || "");
+
+    if (!isValidId) {
+      return res.status(400).json({
+        message: "Invalid id.",
+      });
+    }
+
+    const result = await getHistoricAccount(id);
+
+    if (!result.success && !result.flag)
+      return res.status(500).json({
+        message: "Something went wrong",
+      });
+
+    if (!result.success && result?.flag)
+      return res.status(400).json({
+        message: result?.message,
+      });
+
+    return res.status(200).json({
+      message: result?.message,
+      data: result?.data,
+    });
+  } catch (error) {
+    return res.status(400).json({
+      message: "Malicious request.",
+    });
+  }
+});
+
+/**
+ * Get all account
+ */
+app.get("/historic-accounts", isAuthenticated, async function (req, res) {
+  const queryParams = req.query || {};
+  const result = await getHistoricAccounts(queryParams);
+
+  if (!result?.success)
+    return res.status(500).json({
+      message: "Something went wrong",
+    });
+
+  return res.status(200).json({
+    message: result?.message,
+    data: result?.data,
+    page: +(result?.page || 0),
+    pageCount: +(result?.pageCount || 0),
+    total: +result?.total,
+  });
 });
 
 /**
  * Insert account type
  */
 
-app.post("/account-type", authenticateToken, async function (req, res) {
+app.post("/account-type", isAuthenticated, async function (req, res) {
   const input = req.body || {};
   const validateResult = validateAccountType(input, "insert");
 
@@ -486,7 +960,7 @@ app.post("/account-type", authenticateToken, async function (req, res) {
 /**
  * Update account type
  */
-app.put("/account-type", authenticateToken, async function (req, res) {
+app.put("/account-type", isAuthenticated, async function (req, res) {
   const input = req.body || {};
   const validateResult = validateAccountType(input, "update");
 
@@ -515,7 +989,7 @@ app.put("/account-type", authenticateToken, async function (req, res) {
 /**
  * Get account type
  */
-app.get("/account-type/:id", authenticateToken, async function (req, res) {
+app.get("/account-type/:id", isAuthenticated, async function (req, res) {
   const id = req.params.id;
 
   if (!Boolean(id))
@@ -544,7 +1018,7 @@ app.get("/account-type/:id", authenticateToken, async function (req, res) {
 /**
  * Get account type
  */
-app.delete("/account-type/:id", authenticateToken, async function (req, res) {
+app.delete("/account-type/:id", isAuthenticated, async function (req, res) {
   const id = req.params.id;
 
   if (!Boolean(id))
@@ -572,7 +1046,7 @@ app.delete("/account-type/:id", authenticateToken, async function (req, res) {
 /**
  * Get all account type
  */
-app.get("/accounts-type", authenticateToken, async function (req, res) {
+app.get("/accounts-type", isAuthenticated, async function (req, res) {
   const queryParams = req.query || {};
   const result = await getAllAccountType(queryParams);
 
@@ -593,7 +1067,7 @@ app.get("/accounts-type", authenticateToken, async function (req, res) {
 /**
  * Get a telegram account credentials
  */
-app.post("/verify_password", authenticateToken, async function (req, res) {
+app.post("/verify_password", isAuthenticated, async function (req, res) {
   const passCode = req.body?.passCode;
   if (!passCode)
     return res.status(400).json({
@@ -622,7 +1096,7 @@ app.post("/verify_password", authenticateToken, async function (req, res) {
 /**
  * Get a telegram account credentials
  */
-app.get("/password_all", authenticateToken, async function (__, res) {
+app.get("/password_all", isAuthenticated, async function (__, res) {
   try {
     const data = await TgAccounPassCodeModel.find();
     return res.status(200).json({

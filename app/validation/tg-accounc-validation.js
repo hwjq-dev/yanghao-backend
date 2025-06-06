@@ -5,7 +5,7 @@ const TgAccountSchema = object({
   username: string(),
   nickname: string(),
   phoneNumber: optional(string()),
-  serverIp: string(),
+  serverIp: optional(string()),
   accountBio: optional(string()),
   accountType: string(),
   isPremium: boolean(),
